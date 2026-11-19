@@ -2,7 +2,7 @@
 
 Application **R Shiny** qui calibre et simule des scénarios économiques pour la **gestion actif-passif (ALM) en assurance vie** : évolution du CAC40 et du taux souverain à 10 ans sur 5 ans, avec option de choc de crise. Projet réalisé dans le cadre du Master Actuariat.
 
-🔗 **Application en ligne :** https://elixirsoro27.shinyapps.io/GSEREPORT-1/
+🔗 **Application en ligne :** https://elixirsoro27.shinyapps.io/gse-alm-assurance-vie/
 
 ## Modèles
 
