@@ -5,6 +5,100 @@ library(lubridate)
 library(readxl)
 library(plotly)
 
+# Lecture robuste d'un fichier de cours (CSV ou XLSX).
+# Les exports d'Investing.com ouverts dans Excel mélangent deux formats de date :
+# du texte "m/d/Y" (jour > 12) et des cellules date où Excel a inversé jour et mois
+# (jour <= 12). Ces cellules sont remises dans le bon ordre.
+read_market_file <- function(path, name) {
+  ext <- tolower(tools::file_ext(name))
+  if (ext %in% c("csv", "txt")) {
+    df <- readr::read_csv(path, show_col_types = FALSE, col_types = readr::cols(.default = "c"))
+    dates <- lubridate::as_date(lubridate::parse_date_time(df[[1]], orders = c("Y-m-d", "m/d/Y", "d/m/Y")))
+  } else {
+    df <- readxl::read_excel(path, col_types = "list")
+    raw <- df[[1]]
+    is_dt <- vapply(raw, function(x) inherits(x, "POSIXct"), logical(1))
+    mixed <- any(is_dt) && any(!is_dt)
+    dates <- as.Date(rep(NA_real_))[seq_along(raw)]
+    for (i in seq_along(raw)) {
+      x <- raw[[i]]
+      if (is_dt[i]) {
+        d <- as.Date(x)
+        dates[i] <- if (mixed) lubridate::make_date(lubridate::year(d), lubridate::day(d), lubridate::month(d)) else d
+      } else {
+        dates[i] <- lubridate::as_date(lubridate::parse_date_time(as.character(x), orders = c("Y-m-d", "m/d/Y", "d/m/Y"), quiet = TRUE))
+      }
+    }
+    df <- as.data.frame(lapply(df, function(col) vapply(col, function(v) if (is.null(v) || length(v) == 0) NA_character_ else as.character(v), character(1))),
+                        stringsAsFactors = FALSE, check.names = FALSE)
+  }
+  names(df) <- make.names(names(df))
+  df$Date <- dates
+  n_lost <- sum(is.na(df$Date))
+  if (n_lost > 0) warning(sprintf("%d lignes sans date lisible ont été écartées.", n_lost))
+  df <- df[!is.na(df$Date), ]
+  df[order(df$Date), ]
+}
+
+# ---- Market SCR (Solvency II standard formula vs. GSE scenarios) ----------
+# Stylised life-insurer balance sheet: equities, bonds (zero-coupon equivalent
+# of duration dur_a) and best-estimate liabilities (duration dur_l), all
+# discounted at a flat rate equal to the 10-year yield. Amounts in EUR m,
+# rates in %. Loss-absorbing capacity of technical provisions is ignored.
+SII_UP   <- c(.70, .70, .64, .59, .55, .52, .49, .47, .44, .42, .39, .37, .35, .34, .33, .31, .30, .29, .27, .26)
+SII_DOWN <- c(.75, .65, .56, .50, .46, .42, .39, .36, .33, .31, .30, .29, .28, .28, .27, .28, .28, .28, .29, .29)
+
+# Relative shock at maturity t (Delegated Regulation 2015/35, art. 166-167):
+# table for 1-20 years, linear interpolation, 20 % beyond 90 years.
+sii_rel_shock <- function(t, tab, below_1y) {
+  stopifnot(is.numeric(t), length(t) == 1, t >= 0)
+  if (t < 1) return(below_1y)
+  if (t <= 20) return(approx(1:20, tab, xout = t)$y)
+  if (t >= 90) return(0.20)
+  approx(c(20, 90), c(tab[20], 0.20), xout = t)$y
+}
+# Upward shock: at least +1 point. Downward shock: nil for negative rates.
+sii_rate_up   <- function(r, t) r + max(r * sii_rel_shock(t, SII_UP, 0.70), 1)
+sii_rate_down <- function(r, t) if (r > 0) r * (1 - sii_rel_shock(t, SII_DOWN, 0.75)) else r
+
+# Change in net asset value for an equity return and new discount rates.
+nav_change <- function(bs, eq_ret, r_a, r_l) {
+  d_bonds <- bs$bonds * (exp(-(r_a - bs$r0) / 100 * bs$dur_a) - 1)
+  d_liab  <- bs$liab  * (exp(-(r_l - bs$r0) / 100 * bs$dur_l) - 1)
+  bs$equity * eq_ret + d_bonds - d_liab
+}
+
+scr_standard <- function(bs, equity_shock = 0.39, sym_adj = 0) {
+  stopifnot(abs(sym_adj) <= 0.10)
+  eq  <- bs$equity * (equity_shock + sym_adj)
+  up   <- -nav_change(bs, 0, sii_rate_up(bs$r0, bs$dur_a),   sii_rate_up(bs$r0, bs$dur_l))
+  down <- -nav_change(bs, 0, sii_rate_down(bs$r0, bs$dur_a), sii_rate_down(bs$r0, bs$dur_l))
+  int <- max(up, down, 0)
+  rho <- if (down > up && down > 0) 0.5 else 0   # correlation A of the market module
+  mkt <- sqrt(eq^2 + int^2 + 2 * rho * eq * int)
+  list(equity = eq, rate_up = up, rate_down = down, rate = int,
+       direction = if (int == 0) "none" else if (down > up) "down" else "up",
+       rho = rho, market = mkt, diversification = eq + int - mkt)
+}
+
+# SCR from the scenarios: 99.5 % loss of NAV over one year (12-month equity
+# return and 12-month yield applied to today's balance sheet).
+scr_gse <- function(bs, S0, S12, r12, level = 0.995) {
+  stopifnot(length(S12) == length(r12), length(S12) >= 200)
+  d_eq  <- bs$equity * (S12 / S0 - 1)
+  d_int <- nav_change(bs, 0, r12, r12)
+  d_nav <- d_eq + d_int
+  q <- function(x) -unname(quantile(x, 1 - level))
+  list(equity = q(d_eq), rate = q(d_int), market = q(d_nav),
+       diversification = q(d_eq) + q(d_int) - q(d_nav), d_nav = d_nav)
+}
+
+make_balance_sheet <- function(total_assets, equity_share, dur_a, liab, dur_l, r0) {
+  stopifnot(total_assets > 0, equity_share >= 0, equity_share <= 1, liab >= 0, dur_a >= 0, dur_l >= 0)
+  list(equity = total_assets * equity_share, bonds = total_assets * (1 - equity_share),
+       liab = liab, dur_a = dur_a, dur_l = dur_l, r0 = r0, own_funds = total_assets - liab)
+}
+
 ui <- fluidPage(
   titlePanel("Economic Scenario Generator: CAC40 & 10-Year Bond Yield"),
   sidebarLayout(
@@ -66,6 +160,26 @@ ui <- fluidPage(
                                       plotlyOutput("corrPlot")
                              )
                  )
+        ),
+        tabPanel("Market SCR",
+                 h4("Stylised life-insurer balance sheet (EUR m)"),
+                 fluidRow(
+                   column(4, numericInput("bsAssets", "Total assets", 1000, min = 1),
+                             numericInput("bsEqShare", "Equity share (%)", 15, min = 0, max = 100)),
+                   column(4, numericInput("bsDurA", "Bond duration (years)", 6, min = 0),
+                             numericInput("bsLiab", "Best-estimate liabilities", 900, min = 0)),
+                   column(4, numericInput("bsDurL", "Liability duration (years)", 10, min = 0),
+                             numericInput("symAdj", "Equity symmetric adjustment (%)", 0, min = -10, max = 10))
+                 ),
+                 helpText("Assets and liabilities are discounted at a flat rate equal to the last observed 10-year yield.",
+                          "The loss-absorbing capacity of technical provisions (profit sharing) is ignored.",
+                          "The GSE figure is the 99.5 % one-year loss of net asset value across the simulated scenarios",
+                          "(crisis shock excluded); it needs at least 1,000 scenarios to be meaningful."),
+                 h4("Standard formula vs. scenarios"),
+                 tableOutput("scrTable"),
+                 verbatimTextOutput("scrNote"),
+                 h4("One-year change in net asset value across scenarios"),
+                 plotlyOutput("navPlot")
         )
       )
     )
@@ -78,48 +192,21 @@ server <- function(input, output, session) {
   # Reactive expression to read and clean CAC40 data
   stockData <- reactive({
     req(input$stockFile)
-    ext <- tools::file_ext(input$stockFile$name)
-    if(ext %in% c("csv","txt")){
-      df <- read_csv(input$stockFile$datapath)
-    } else {
-      df <- read_excel(input$stockFile$datapath)
-    }
-    # Standardize column names and parse dates
-    df <- df %>% rename_all(~ make.names(.)) %>%
-      mutate(Date = as.Date(parse_date_time(Date, 
-                                            orders = c("Y-m-d","d/m/Y","m/d/Y")))) %>%
-      filter(!is.na(Date)) %>% arrange(Date)
+    df <- read_market_file(input$stockFile$datapath, input$stockFile$name)
     # Convert Price/Close to numeric
-    if("Price" %in% names(df)){
-      df$Price <- as.numeric(gsub(",", "", df$Price))
-    } else if("Close" %in% names(df)){
-      df$Price <- as.numeric(gsub(",", "", df$Close))
-    }
-    df <- df %>% filter(!is.na(Price))
-    return(df)
+    price_col <- if ("Price" %in% names(df)) "Price" else "Close"
+    df$Price <- as.numeric(gsub(",", "", df[[price_col]]))
+    df %>% filter(!is.na(Price))
   })
   
   # Reactive expression to read and clean bond yield data
   bondData <- reactive({
     req(input$bondFile)
-    ext <- tools::file_ext(input$bondFile$name)
-    if(ext %in% c("csv","txt")){
-      df <- read_csv(input$bondFile$datapath)
-    } else {
-      df <- read_excel(input$bondFile$datapath)
-    }
-    df <- df %>% rename_all(~ make.names(.)) %>%
-      mutate(Date = as.Date(parse_date_time(Date, 
-                                            orders = c("Y-m-d","d/m/Y","m/d/Y")))) %>%
-      filter(!is.na(Date)) %>% arrange(Date)
+    df <- read_market_file(input$bondFile$datapath, input$bondFile$name)
     # Convert "Dernier"/Close to numeric yield (remove % sign)
-    if("Dernier" %in% names(df)){
-      df$Yield <- as.numeric(gsub("%","", df$Dernier))
-    } else if("Close" %in% names(df)){
-      df$Yield <- as.numeric(gsub("%","", df$Close))
-    }
-    df <- df %>% filter(!is.na(Yield))
-    return(df)
+    yield_col <- if ("Dernier" %in% names(df)) "Dernier" else "Close"
+    df$Yield <- as.numeric(gsub("%", "", gsub(",", ".", df[[yield_col]])))
+    df %>% filter(!is.na(Yield))
   })
   
   # Display the first few rows of each dataset
@@ -267,6 +354,8 @@ server <- function(input, output, session) {
       simR[i+1, ] <- b + (simR[i, ] - b)*exp(-a*dt) +
         sigma_v*sqrt((1 - exp(-2*a*dt))/(2*a)) * Ze
     }
+    # Keep the 12-month values before any crisis shock, for the SCR tab
+    S12 <- simS[13, ]; R12 <- simR[13, ]
     # Apply stress shock if requested
     if(input$shock){
       shock_month <- 12  # at 12 months
@@ -277,7 +366,7 @@ server <- function(input, output, session) {
         simR[(shock_month+1):(nSteps+1), ] <- simR[(shock_month+1):(nSteps+1), ] - 1.0
       }
     }
-    list(simS = simS, simR = simR)
+    list(simS = simS, simR = simR, S12 = S12, R12 = R12, S0 = S0, r0 = r0)
   })
 
   # Keep the scenario slider within the number of simulated scenarios
@@ -398,6 +487,43 @@ server <- function(input, output, session) {
 
     subplot(ggplotly(p1), ggplotly(p2), nrows = 2, shareX = TRUE) %>%
       plotly::layout(title = paste("Scenario", sid))
+  })
+
+  # ---- Market SCR tab ----
+  scrResults <- reactive({
+    res <- simulation()
+    req(input$bsAssets > 0, input$bsLiab >= 0, input$bsEqShare >= 0, input$bsEqShare <= 100,
+        abs(input$symAdj) <= 10, ncol(res$simS) >= 200)
+    bs <- make_balance_sheet(input$bsAssets, input$bsEqShare / 100, input$bsDurA,
+                             input$bsLiab, input$bsDurL, res$r0)
+    list(bs = bs, sf = scr_standard(bs, sym_adj = input$symAdj / 100),
+         gse = scr_gse(bs, res$S0, res$S12, res$R12), n = ncol(res$simS))
+  })
+  output$scrTable <- renderTable({
+    x <- scrResults(); sf <- x$sf; g <- x$gse; of <- x$bs$own_funds
+    tibble(
+      Module = c("Equity", "Interest rate", "Diversification", "Market SCR", "Solvency ratio (own funds / SCR)"),
+      `Standard formula` = c(sf$equity, sf$rate, -sf$diversification, sf$market, 100 * of / sf$market),
+      `GSE scenarios (99.5 %)` = c(g$equity, g$rate, -g$diversification, g$market, 100 * of / g$market)
+    )
+  }, digits = 1)
+  output$scrNote <- renderPrint({
+    x <- scrResults(); sf <- x$sf
+    cat(sprintf("Own funds: %.1f | Starting 10-year yield: %.2f %%\n", x$bs$own_funds, x$bs$r0))
+    cat(sprintf("Standard formula interest-rate scenario: %s (up loss %.1f, down loss %.1f), equity/rate correlation %.1f\n",
+                sf$direction, sf$rate_up, sf$rate_down, sf$rho))
+    if (x$n < 1000) cat("Warning: fewer than 1,000 scenarios, the 99.5 % quantile is unreliable.\n")
+  })
+  output$navPlot <- renderPlotly({
+    x <- scrResults()
+    p <- ggplot(tibble(dNAV = x$gse$d_nav), aes(dNAV)) +
+      geom_histogram(bins = 80, fill = "steelblue", color = "white") +
+      geom_vline(xintercept = -x$gse$market, color = "orange", linewidth = 1) +
+      geom_vline(xintercept = -x$sf$market, linetype = "dashed") +
+      labs(x = "One-year change in net asset value (EUR m)", y = "Scenarios",
+           title = "Orange: GSE 99.5 % loss | dashed: standard formula SCR") +
+      theme_minimal()
+    ggplotly(p)
   })
 
 }
