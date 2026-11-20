@@ -428,18 +428,15 @@ server <- function(input, output, session) {
     res <- simulation()
     simS <- res$simS[-1, ]  # drop initial row
     # Compute quantiles over scenarios for each time step
-    probs <- seq(0.05, 0.95, by=0.05)
-    q_matrix <- apply(simS, 1, quantile, probs=probs)
-    dfQ <- as.data.frame(t(q_matrix))
-    dfQ$Month <- 1:nrow(dfQ)
-    # Build ribbon data for successive quantile bands
-    ribbons <- data.frame(
-      Month = rep(dfQ$Month, times=length(probs)/2),
-      ymin = c(dfQ$X05., dfQ$X15., dfQ$X25., dfQ$X35., dfQ$X45.),
-      ymax = c(dfQ$X95., dfQ$X85., dfQ$X75., dfQ$X65., dfQ$X55.)
-    )
+    probs <- c(0.05, 0.15, 0.25, 0.35, 0.45, 0.50, 0.55, 0.65, 0.75, 0.85, 0.95)
+    q <- t(apply(simS, 1, quantile, probs = probs))
+    # Nested bands 5-95 %, 15-85 %, 25-75 %, 35-65 %, 45-55 %
+    lo <- 1:5; hi <- 11:7
+    ribbons <- bind_rows(lapply(1:5, function(k)
+      tibble(Month = seq_len(nrow(q)), ymin = q[, lo[k]], ymax = q[, hi[k]], band = k)))
+    dfQ <- tibble(Month = seq_len(nrow(q)), X50. = q[, 6])
     p <- ggplot() +
-      geom_ribbon(data = ribbons, aes(x=Month, ymin=ymin, ymax=ymax, fill=factor(ymin)), alpha=0.25) +
+      geom_ribbon(data = ribbons, aes(x=Month, ymin=ymin, ymax=ymax, group=band), fill="steelblue", alpha=0.2) +
       geom_line(data = dfQ, aes(x=Month, y=X50.), color="red", linewidth=1) +
       labs(title="CAC40 Fan Chart (by Month)", x="Month", y="Price") + theme_minimal() +
       theme(legend.position="none")
